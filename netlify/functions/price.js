@@ -1,129 +1,163 @@
-import fetch from "node-fetch";
+// netlify/functions/price.js (ESM)
+// Uses global fetch (Node 18+ on Netlify) — NO node-fetch import needed.
+
+const HOSTAWAY_BASE = "https://api.hostaway.com";
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+};
+
+function json(statusCode, body) {
+  return {
+    statusCode,
+    headers: { ...corsHeaders, "Content-Type": "application/json; charset=utf-8" },
+    body: JSON.stringify(body),
+  };
+}
+
+function isISODate(s) {
+  return typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s);
+}
+
+function round2(n) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return null;
+  return Math.round((x + Number.EPSILON) * 100) / 100;
+}
+
+async function getAccessToken() {
+  const ACCOUNT_ID = process.env.HOSTAWAY_ACCOUNT_ID;
+  const API_KEY = process.env.HOSTAWAY_API_KEY;
+
+  if (!ACCOUNT_ID || !API_KEY) {
+    throw new Error("Missing HOSTAWAY_ACCOUNT_ID / HOSTAWAY_API_KEY env vars");
+  }
+
+  const tokRes = await fetch(`${HOSTAWAY_BASE}/v1/accessTokens`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "client_credentials",
+      client_id: ACCOUNT_ID,
+      client_secret: API_KEY,
+      scope: "general",
+    }),
+  });
+
+  const tokJson = await tokRes.json().catch(() => ({}));
+  if (!tokRes.ok || !tokJson?.access_token) {
+    throw new Error(`Token request failed: ${tokJson?.message || tokJson?.error || "unknown"}`);
+  }
+  return tokJson.access_token;
+}
 
 export async function handler(event) {
+  if (event.httpMethod === "OPTIONS") return { statusCode: 204, headers: corsHeaders, body: "" };
+  if (event.httpMethod !== "POST") return json(405, { error: "Method not allowed. Use POST." });
+
+  let data;
   try {
-    // CORS
-    if (event.httpMethod === "OPTIONS") {
-      return {
-        statusCode: 200,
-        headers: {
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Headers": "Content-Type, Authorization",
-          "Access-Control-Allow-Methods": "POST, OPTIONS",
-        },
-        body: "",
-      };
-    }
+    data = JSON.parse(event.body || "{}");
+  } catch {
+    return json(400, { error: "Invalid JSON body" });
+  }
 
-    if (event.httpMethod !== "POST") {
-      return json(405, { error: "Method not allowed" });
-    }
+  const { arrival, departure } = data;
+  const guests = Math.max(1, Math.min(10, Number(data.guests) || 1));
 
-    const { arrival, departure, guests } = JSON.parse(event.body || "{}");
+  if (!isISODate(arrival) || !isISODate(departure)) {
+    return json(400, { error: "arrival and departure must be YYYY-MM-DD" });
+  }
 
-    if (!arrival || !departure || !guests) {
-      return json(400, { error: "Missing arrival, departure or guests" });
-    }
+  const start = new Date(`${arrival}T00:00:00Z`);
+  const end = new Date(`${departure}T00:00:00Z`);
+  const nights = Math.max(0, Math.round((end - start) / 86400000));
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || nights < 1) {
+    return json(400, { error: "Invalid dates", hint: "Departure must be after Arrival (min 1 night)." });
+  }
 
-    // ENV VARS
-    const ACCOUNT_ID = process.env.HOSTAWAY_ACCOUNT_ID;
-    const API_KEY = process.env.HOSTAWAY_API_KEY;
-    const LISTING_ID = process.env.HOSTAWAY_LISTING_ID;
+  const LISTING_ID = process.env.HOSTAWAY_LISTING_ID;
+  if (!LISTING_ID) return json(500, { error: "Missing HOSTAWAY_LISTING_ID env var" });
 
-    if (!ACCOUNT_ID) return json(500, { error: "Missing HOSTAWAY_ACCOUNT_ID env var" });
-    if (!API_KEY) return json(500, { error: "Missing HOSTAWAY_API_KEY env var" });
-    if (!LISTING_ID) return json(500, { error: "Missing HOSTAWAY_LISTING_ID env var" });
+  // ✅ POPUST (default 10% ako ne postaviš env var)
+  const discountPct = Number(process.env.WEBSITE_DISCOUNT_PCT ?? 10);
+  const discountMult = 1 - Math.max(0, Math.min(100, discountPct)) / 100;
 
-    // 1️⃣ GET ACCESS TOKEN
-    const tokenRes = await fetch("https://api.hostaway.com/v1/accessTokens", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        grant_type: "client_credentials",
-        client_id: ACCOUNT_ID,
-        client_secret: API_KEY,
-        scope: "general",
-      }),
-    });
+  try {
+    const token = await getAccessToken();
 
-    const tokenData = await tokenRes.json();
-
-    if (!tokenData.access_token) {
-      return json(500, { error: "Failed to get access token", raw: tokenData });
-    }
-
-    const accessToken = tokenData.access_token;
-
-    // 2️⃣ CALL PRICE CALCULATION
-    const priceRes = await fetch(
-      `https://api.hostaway.com/v1/listings/${LISTING_ID}/calendar/price`,
+    const priceDetailsRes = await fetch(
+      `${HOSTAWAY_BASE}/v1/listings/${encodeURIComponent(LISTING_ID)}/calendar/priceDetails`,
       {
         method: "POST",
-        headers: {
-          "Authorization": `Bearer ${accessToken}`,
-          "Content-Type": "application/json",
-        },
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
         body: JSON.stringify({
-          startDate: arrival,
-          endDate: departure,
+          startingDate: arrival,
+          endingDate: departure,
           numberOfGuests: guests,
-          channelId: 2020,
+          version: 2,
         }),
       }
     );
 
-    const raw = await priceRes.json();
-
-    if (!raw || raw.status !== "success") {
-      return json(502, { error: "Hostaway price API failed", raw });
+    const raw = await priceDetailsRes.json().catch(() => ({}));
+    if (!priceDetailsRes.ok) {
+      return json(priceDetailsRes.status || 500, {
+        error: "Hostaway priceDetails failed",
+        message: raw?.message || raw?.error || "unknown",
+        details: raw,
+      });
     }
 
-    const result = raw.result;
+    // Hostaway shape you are getting:
+    // raw.status = "success"
+    // raw.result.components = [...]
+    const result = raw?.result || raw?.data?.result || raw?.data || raw;
+    const components = result?.components;
 
-    // 3️⃣ PARSE COMPONENTS (OVDE JE POPRAVKA)
-    const components = result.components || [];
-
-    // nightly subtotal = samo accommodation (bez cleaning fee)
-    let nightlySubtotal = components
-      .filter((c) => c.type === "accommodation")
-      .reduce((sum, c) => sum + Number(c.total || 0), 0);
-
-    if (!nightlySubtotal || !Number.isFinite(nightlySubtotal)) {
-      return json(502, { error: "Could not read nightly subtotal from priceDetails", raw });
+    if (!Array.isArray(components)) {
+      return json(502, { error: "Hostaway response missing components[]", raw });
     }
 
-    // cleaning fee (ako postoji)
-    const cleaningFeeObj = components.find((c) => c.name === "cleaningFee");
-    const cleaningFee = cleaningFeeObj ? Number(cleaningFeeObj.total || 0) : 0;
+    // ✅ accommodation subtotal (base rate etc.)
+    const nightlySubtotalBase = components
+      .filter((c) => c?.type === "accommodation" && Number.isFinite(Number(c?.total)))
+      .reduce((sum, c) => sum + Number(c.total), 0);
 
-    const totalPrice = Number(result.totalPrice || nightlySubtotal + cleaningFee);
+    // ✅ fees subtotal (cleaning fee + any other fee components)
+    const feesTotal = components
+      .filter((c) => c?.type !== "accommodation" && Number.isFinite(Number(c?.total)))
+      .reduce((sum, c) => sum + Number(c.total), 0);
 
-    // 4️⃣ RETURN CLEAN RESPONSE FRONTENDU
+    if (!Number.isFinite(nightlySubtotalBase) || nightlySubtotalBase <= 0) {
+      return json(502, { error: "Could not compute accommodation subtotal from components", raw });
+    }
+
+    // ✅ apply discount ONLY to accommodation
+    const nightlySubtotal = round2(nightlySubtotalBase * discountMult);
+    const totalPriceDiscounted = round2(nightlySubtotal + feesTotal);
+    const perNight = nights > 0 ? round2(nightlySubtotal / nights) : null;
+
+    const currency = result?.currency || raw?.currency || "CHF";
+    const totalPriceBase = Number(result?.totalPrice) ? round2(result.totalPrice) : null;
+
     return json(200, {
-      success: true,
-      arrival,
-      departure,
-      guests,
-      nightlySubtotal,
-      cleaningFee,
-      totalPrice,
+      currency,
+      nights,
+      breakdown: {
+        nightlySubtotalBase: round2(nightlySubtotalBase),
+        nightlySubtotal, // ✅ discounted accommodation subtotal
+        feesTotal: round2(feesTotal),
+        totalPriceBase, // Hostaway original total (if present)
+        totalPrice: totalPriceDiscounted, // ✅ discounted total you show on website
+        perNight,
+        discountPct: round2(discountPct),
+      },
+      // raw, // uncomment only for debugging
     });
-
-  } catch (err) {
-    console.error("PRICE FUNCTION ERROR:", err);
-    return json(500, { error: "Internal server error", details: err.message });
+  } catch (e) {
+    return json(500, { error: "Server error", details: String(e?.message || e) });
   }
-}
-
-function json(statusCode, data) {
-  return {
-    statusCode,
-    headers: {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
-      "Access-Control-Allow-Methods": "POST, OPTIONS",
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(data),
-  };
 }
