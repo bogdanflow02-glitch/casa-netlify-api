@@ -1,3 +1,8 @@
+// netlify/functions/book.js  (CommonJS, Node 18+ / Netlify)
+// Hostaway-driven pricing: we DO NOT apply any extra discount here.
+// We use Hostaway priceDetails.totalPrice (already includes Hostaway discounts like weekly/monthly)
+// and pass financeField through to the reservation create.
+
 const HOSTAWAY_BASE = "https://api.hostaway.com";
 
 const corsHeaders = {
@@ -59,17 +64,19 @@ async function getAccessToken() {
   return tokJson.access_token;
 }
 
-async function calcDiscountedPriceDetails({
+/**
+ * Fetch Hostaway priceDetails for the selected dates.
+ * IMPORTANT:
+ * - totalPrice returned here already includes Hostaway discounts (weekly/monthly/etc) if configured.
+ * - financeField must be passed through unchanged when creating reservation.
+ */
+async function getHostawayPriceDetails({
   accessToken,
   listingId,
   arrival,
   departure,
   guests,
-  discountPct,
 }) {
-  const discount = Math.max(0, Math.min(100, Number(discountPct) || 0));
-  const mult = 1 - discount / 100;
-
   const r = await fetch(
     `${HOSTAWAY_BASE}/v1/listings/${encodeURIComponent(listingId)}/calendar/priceDetails`,
     {
@@ -97,25 +104,28 @@ async function calcDiscountedPriceDetails({
     };
   }
 
-  const totalPriceBase =
-    Number(raw?.totalPrice) ||
-    Number(raw?.data?.totalPrice) ||
-    Number(raw?.result?.totalPrice) ||
+  // Your observed shape: { status:"success", result:{ totalPrice, components, ... } }
+  const result = raw?.result || raw?.data?.result || raw?.data || raw;
+
+  const totalPrice =
+    Number(result?.totalPrice) ??
+    Number(raw?.totalPrice) ??
+    Number(raw?.data?.totalPrice) ??
     null;
 
   const financeField =
+    result?.financeField ||
     raw?.financeField ||
     raw?.data?.financeField ||
-    raw?.result?.financeField ||
     null;
 
   const currency =
+    result?.currency ||
     raw?.currency ||
     raw?.data?.currency ||
-    raw?.result?.currency ||
     "CHF";
 
-  if (!Number.isFinite(totalPriceBase) || !financeField) {
+  if (!Number.isFinite(totalPrice) || !financeField) {
     return {
       ok: false,
       status: 502,
@@ -124,13 +134,10 @@ async function calcDiscountedPriceDetails({
     };
   }
 
-  const totalPriceDiscounted = round2(totalPriceBase * mult);
-
   return {
     ok: true,
     currency,
-    totalPriceBase: round2(totalPriceBase),
-    totalPriceDiscounted,
+    totalPrice: round2(totalPrice), // Hostaway-calculated total (incl. Hostaway discounts)
     financeField,
   };
 }
@@ -150,11 +157,13 @@ exports.handler = async (event) => {
     return json(400, { error: "Invalid JSON body" });
   }
 
+  // Required fields
   const required = ["arrival", "departure", "name", "email", "phone", "guests"];
   for (const f of required) {
     if (!data[f]) return json(400, { error: `Missing field: ${f}` });
   }
 
+  // Validate dates
   if (!isISODate(data.arrival) || !isISODate(data.departure)) {
     return json(400, { error: "arrival/departure must be YYYY-MM-DD" });
   }
@@ -169,9 +178,8 @@ exports.handler = async (event) => {
     });
   }
 
+  // ENV
   const LISTING_ID = Number(process.env.HOSTAWAY_LISTING_ID);
-  const DISCOUNT_PCT = Number(process.env.WEBSITE_DISCOUNT_PCT ?? 10);
-
   if (!Number.isFinite(LISTING_ID)) {
     return json(500, { error: "Missing/invalid HOSTAWAY_LISTING_ID env var" });
   }
@@ -180,15 +188,16 @@ exports.handler = async (event) => {
   const { firstName, lastName } = splitName(data.name);
 
   try {
+    // 1) Token
     const accessToken = await getAccessToken();
 
-    const priceCalc = await calcDiscountedPriceDetails({
+    // 2) Get Hostaway priceDetails (includes Hostaway discounts)
+    const priceCalc = await getHostawayPriceDetails({
       accessToken,
       listingId: LISTING_ID,
       arrival: data.arrival,
       departure: data.departure,
       guests,
-      discountPct: DISCOUNT_PCT,
     });
 
     if (!priceCalc.ok) {
@@ -200,7 +209,8 @@ exports.handler = async (event) => {
       });
     }
 
-    const channelId = 2020;
+    // 3) Create reservation
+    const channelId = 2020; // partner/website
 
     const reservationPayload = {
       channelId,
@@ -208,6 +218,7 @@ exports.handler = async (event) => {
       listingId: LISTING_ID,
       source: "website",
 
+      // IMPORTANT: reservation date fields (not startDate/endDate)
       arrivalDate: data.arrival,
       departureDate: data.departure,
 
@@ -219,7 +230,8 @@ exports.handler = async (event) => {
       firstName,
       lastName,
 
-      totalPrice: priceCalc.totalPriceDiscounted,
+      // ✅ Hostaway-driven amount + financeField
+      totalPrice: priceCalc.totalPrice,
       financeField: priceCalc.financeField,
     };
 
@@ -243,12 +255,11 @@ exports.handler = async (event) => {
     }
 
     return json(200, {
-      message: "Booking request created (discounted price sent to Hostaway)",
+      message: "Booking request created (Hostaway-driven total sent to Hostaway)",
       nights,
       channelId,
       currency: priceCalc.currency,
-      totalPriceBase: priceCalc.totalPriceBase,
-      totalPriceDiscounted: priceCalc.totalPriceDiscounted,
+      totalPriceSentToHostaway: priceCalc.totalPrice,
       hostaway: result,
     });
   } catch (err) {
