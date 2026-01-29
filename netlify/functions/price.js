@@ -1,6 +1,4 @@
-// netlify/functions/price.js (ESM)
-// Uses global fetch (Node 18+ on Netlify)
-
+// netlify/functions/price.js (ESM) — FIXED for Booking Engine Markup (-10) logic
 const HOSTAWAY_BASE = "https://api.hostaway.com";
 
 const corsHeaders = {
@@ -53,9 +51,9 @@ async function getAccessToken() {
   return tokJson.access_token;
 }
 
-function sumByType(components, type) {
+function sumTotals(components, predicateFn) {
   return components
-    .filter((c) => c?.type === type && Number.isFinite(Number(c?.total)))
+    .filter((c) => c && predicateFn(c) && Number.isFinite(Number(c.total)))
     .reduce((sum, c) => sum + Number(c.total), 0);
 }
 
@@ -81,10 +79,7 @@ export async function handler(event) {
   const end = new Date(`${departure}T00:00:00Z`);
   const nights = Math.max(0, Math.round((end - start) / 86400000));
   if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || nights < 1) {
-    return json(400, {
-      error: "Invalid dates",
-      hint: "Departure must be after Arrival (min 1 night).",
-    });
+    return json(400, { error: "Invalid dates", hint: "Departure must be after Arrival (min 1 night)." });
   }
 
   const LISTING_ID = process.env.HOSTAWAY_LISTING_ID;
@@ -108,7 +103,6 @@ export async function handler(event) {
     );
 
     const raw = await priceDetailsRes.json().catch(() => ({}));
-
     if (!priceDetailsRes.ok) {
       return json(priceDetailsRes.status || 500, {
         error: "Hostaway priceDetails failed",
@@ -117,7 +111,6 @@ export async function handler(event) {
       });
     }
 
-    // Normalize result payload
     const result = raw?.result || raw?.data?.result || raw?.data || raw;
     const components = result?.components;
 
@@ -125,48 +118,35 @@ export async function handler(event) {
       return json(502, { error: "Hostaway response missing components[]", raw });
     }
 
-    // Hostaway provides:
-    // - accommodation: baseRate etc.
-    // - discount: weeklyDiscount/monthlyDiscount etc. (negative totals)
-    // - fee: cleaningFee etc.
-    const accommodationTotal = sumByType(components, "accommodation");
-    const discountsTotal = sumByType(components, "discount"); // usually negative
-    const feesTotal = sumByType(components, "fee");
+    // ✅ Your rule:
+    // accommodation already includes Booking Engine markup (-10)
+    // include all other components EXCEPT "discount" (weekly/monthly/coupon)
+    const accommodationTotal = sumTotals(components, (c) => c.type === "accommodation");
+    const otherIncludedTotal = sumTotals(
+      components,
+      (c) => c.type !== "accommodation" && c.type !== "discount"
+    );
 
     if (!Number.isFinite(accommodationTotal) || accommodationTotal <= 0) {
       return json(502, { error: "Could not compute accommodation subtotal from components", raw });
     }
 
-    // Nightly part after Hostaway discounts (still excluding fees)
-    const nightlySubtotal = round2(accommodationTotal + discountsTotal);
-
-    // Total after fees (this is what you want to show on website)
-    const totalPrice = round2(nightlySubtotal + feesTotal);
-
-    const perNight = nights > 0 ? round2(nightlySubtotal / nights) : null;
-
-    // Informational: effective discount % (only for UI/debug)
-    // Example: accommodation 6122, discounts -612.2 => 10%
-    const discountPctEffective =
-      accommodationTotal > 0 ? round2((Math.abs(discountsTotal) / accommodationTotal) * 100) : null;
+    const totalPrice = round2(accommodationTotal + otherIncludedTotal);
+    const perNight = nights > 0 ? round2(accommodationTotal / nights) : null;
 
     const currency = result?.currency || raw?.currency || "CHF";
-    const totalPriceBase = Number.isFinite(Number(result?.totalPrice)) ? round2(result.totalPrice) : null;
 
     return json(200, {
       currency,
       nights,
+      // ✅ return components so frontend can show cleaning fee etc. without hard-coding
+      components,
       breakdown: {
-        nightlySubtotalBase: round2(accommodationTotal),
-        nightlySubtotal: round2(nightlySubtotal),
-        discountsTotal: round2(discountsTotal),
-        feesTotal: round2(feesTotal),
-        totalPriceBase, // Hostaway's reported totalPrice (already includes their discounts/fees usually)
-        totalPrice,     // computed from components for transparency
+        accommodationSubtotal: round2(accommodationTotal), // already includes Booking Engine Markup
+        otherIncludedTotal: round2(otherIncludedTotal),   // fees/taxes/etc (excluding discount)
+        totalPrice,
         perNight,
-        discountPct: discountPctEffective, // effective % coming from Hostaway rules
       },
-      // raw, // uncomment for debugging only
     });
   } catch (e) {
     return json(500, { error: "Server error", details: String(e?.message || e) });
