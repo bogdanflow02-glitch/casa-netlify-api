@@ -1,7 +1,8 @@
-// netlify/functions/book.js  (CommonJS, Node 18+ / Netlify)
-// Hostaway-driven pricing: we DO NOT apply any extra discount here.
-// We use Hostaway priceDetails.totalPrice (already includes Hostaway discounts like weekly/monthly)
-// and pass financeField through to the reservation create.
+// netlify/functions/book.js (CommonJS, Node 18+ / Netlify)
+// Booking engine markup (-10) is configured in Hostaway and is already included in components.type==="accommodation".
+// We DO NOT apply any discount in code.
+// Total we send to Hostaway = accommodation + all other components EXCEPT type==="discount".
+// We still pass financeField through unchanged.
 
 const HOSTAWAY_BASE = "https://api.hostaway.com";
 
@@ -64,13 +65,18 @@ async function getAccessToken() {
   return tokJson.access_token;
 }
 
+function sumTotals(components, predicateFn) {
+  return components
+    .filter((c) => c && predicateFn(c) && Number.isFinite(Number(c.total)))
+    .reduce((sum, c) => sum + Number(c.total), 0);
+}
+
 /**
- * Fetch Hostaway priceDetails for the selected dates.
- * IMPORTANT:
- * - totalPrice returned here already includes Hostaway discounts (weekly/monthly/etc) if configured.
- * - financeField must be passed through unchanged when creating reservation.
+ * Fetch Hostaway priceDetails and compute:
+ * totalToSend = accommodation (already includes Booking engine markup) + other components excluding "discount"
+ * Also return financeField for reservations create.
  */
-async function getHostawayPriceDetails({
+async function getHostawayComputedTotal({
   accessToken,
   listingId,
   arrival,
@@ -104,41 +110,60 @@ async function getHostawayPriceDetails({
     };
   }
 
-  // Your observed shape: { status:"success", result:{ totalPrice, components, ... } }
   const result = raw?.result || raw?.data?.result || raw?.data || raw;
-
-  const totalPrice =
-    Number(result?.totalPrice) ??
-    Number(raw?.totalPrice) ??
-    Number(raw?.data?.totalPrice) ??
-    null;
+  const components = result?.components;
 
   const financeField =
-    result?.financeField ||
-    raw?.financeField ||
-    raw?.data?.financeField ||
-    null;
+    result?.financeField || raw?.financeField || raw?.data?.financeField || null;
 
-  const currency =
-    result?.currency ||
-    raw?.currency ||
-    raw?.data?.currency ||
-    "CHF";
+  const currency = result?.currency || raw?.currency || raw?.data?.currency || "CHF";
 
-  if (!Number.isFinite(totalPrice) || !financeField) {
+  if (!Array.isArray(components) || components.length === 0) {
     return {
       ok: false,
       status: 502,
-      error: "Missing totalPrice/financeField in priceDetails response",
+      error: "Hostaway response missing components[]",
       raw,
     };
   }
 
+  if (!financeField) {
+    return {
+      ok: false,
+      status: 502,
+      error: "Missing financeField in priceDetails response",
+      raw,
+    };
+  }
+
+  // ✅ Your rule (same as fixed price.js):
+  const accommodationTotal = sumTotals(components, (c) => c.type === "accommodation");
+  const otherIncludedTotal = sumTotals(
+    components,
+    (c) => c.type !== "accommodation" && c.type !== "discount"
+  );
+
+  if (!Number.isFinite(accommodationTotal) || accommodationTotal <= 0) {
+    return {
+      ok: false,
+      status: 502,
+      error: "Could not compute accommodation subtotal from components",
+      raw,
+    };
+  }
+
+  const totalToSend = round2(accommodationTotal + otherIncludedTotal);
+
   return {
     ok: true,
     currency,
-    totalPrice: round2(totalPrice), // Hostaway-calculated total (incl. Hostaway discounts)
     financeField,
+    components,
+    totals: {
+      accommodationSubtotal: round2(accommodationTotal),
+      otherIncludedTotal: round2(otherIncludedTotal),
+      totalToSend,
+    },
   };
 }
 
@@ -188,11 +213,10 @@ exports.handler = async (event) => {
   const { firstName, lastName } = splitName(data.name);
 
   try {
-    // 1) Token
     const accessToken = await getAccessToken();
 
-    // 2) Get Hostaway priceDetails (includes Hostaway discounts)
-    const priceCalc = await getHostawayPriceDetails({
+    // 1) Compute total from Hostaway components (Booking engine markup already included in accommodation)
+    const calc = await getHostawayComputedTotal({
       accessToken,
       listingId: LISTING_ID,
       arrival: data.arrival,
@@ -200,17 +224,17 @@ exports.handler = async (event) => {
       guests,
     });
 
-    if (!priceCalc.ok) {
+    if (!calc.ok) {
       return json(502, {
         error: "Price calculation failed",
-        status: priceCalc.status,
-        message: priceCalc.error,
-        details: priceCalc.raw,
+        status: calc.status,
+        message: calc.error,
+        details: calc.raw,
       });
     }
 
-    // 3) Create reservation
-    const channelId = 2020; // partner/website
+    // 2) Create reservation
+    const channelId = 2020; // partner/website (keep as you have it)
 
     const reservationPayload = {
       channelId,
@@ -218,7 +242,6 @@ exports.handler = async (event) => {
       listingId: LISTING_ID,
       source: "website",
 
-      // IMPORTANT: reservation date fields (not startDate/endDate)
       arrivalDate: data.arrival,
       departureDate: data.departure,
 
@@ -230,9 +253,9 @@ exports.handler = async (event) => {
       firstName,
       lastName,
 
-      // ✅ Hostaway-driven amount + financeField
-      totalPrice: priceCalc.totalPrice,
-      financeField: priceCalc.financeField,
+      // ✅ send computed total (accommodation + fees, excluding discounts)
+      totalPrice: calc.totals.totalToSend,
+      financeField: calc.financeField,
     };
 
     const res = await fetch(`${HOSTAWAY_BASE}/v1/reservations`, {
@@ -255,11 +278,11 @@ exports.handler = async (event) => {
     }
 
     return json(200, {
-      message: "Booking request created (Hostaway-driven total sent to Hostaway)",
+      message: "Booking created (Hostaway booking engine markup price + full fees sent to Hostaway)",
       nights,
       channelId,
-      currency: priceCalc.currency,
-      totalPriceSentToHostaway: priceCalc.totalPrice,
+      currency: calc.currency,
+      totals: calc.totals,
       hostaway: result,
     });
   } catch (err) {
