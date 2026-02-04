@@ -1,4 +1,7 @@
-// netlify/functions/price.js (ESM) — FIXED for Booking Engine Markup (-10) logic
+// netlify/functions/price.js (ESM)
+// Hostaway priceDetails v2 + channelId context (direct/website) to apply channel-specific markup.
+// NOTE: No hard-coded discount logic here. We rely on Hostaway to apply markup when channelId is correct.
+
 const HOSTAWAY_BASE = "https://api.hostaway.com";
 
 const corsHeaders = {
@@ -46,8 +49,11 @@ async function getAccessToken() {
 
   const tokJson = await tokRes.json().catch(() => ({}));
   if (!tokRes.ok || !tokJson?.access_token) {
-    throw new Error(`Token request failed: ${tokJson?.message || tokJson?.error || "unknown"}`);
+    throw new Error(
+      `Token request failed: ${tokJson?.message || tokJson?.error || "unknown"}`
+    );
   }
+
   return tokJson.access_token;
 }
 
@@ -58,8 +64,12 @@ function sumTotals(components, predicateFn) {
 }
 
 export async function handler(event) {
-  if (event.httpMethod === "OPTIONS") return { statusCode: 204, headers: corsHeaders, body: "" };
-  if (event.httpMethod !== "POST") return json(405, { error: "Method not allowed. Use POST." });
+  if (event.httpMethod === "OPTIONS") {
+    return { statusCode: 204, headers: corsHeaders, body: "" };
+  }
+  if (event.httpMethod !== "POST") {
+    return json(405, { error: "Method not allowed. Use POST." });
+  }
 
   let data;
   try {
@@ -78,27 +88,44 @@ export async function handler(event) {
   const start = new Date(`${arrival}T00:00:00Z`);
   const end = new Date(`${departure}T00:00:00Z`);
   const nights = Math.max(0, Math.round((end - start) / 86400000));
+
   if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || nights < 1) {
-    return json(400, { error: "Invalid dates", hint: "Departure must be after Arrival (min 1 night)." });
+    return json(400, {
+      error: "Invalid dates",
+      hint: "Departure must be after Arrival (min 1 night).",
+    });
   }
 
   const LISTING_ID = process.env.HOSTAWAY_LISTING_ID;
-  if (!LISTING_ID) return json(500, { error: "Missing HOSTAWAY_LISTING_ID env var" });
+  if (!LISTING_ID) {
+    return json(500, { error: "Missing HOSTAWAY_LISTING_ID env var" });
+  }
+
+  // ✅ Channel context for direct/website pricing (set in Netlify env vars)
+  const DIRECT_CHANNEL_ID_RAW = process.env.HOSTAWAY_DIRECT_CHANNEL_ID;
+  const DIRECT_CHANNEL_ID = Number(DIRECT_CHANNEL_ID_RAW);
+  const hasDirectChannelId = Number.isFinite(DIRECT_CHANNEL_ID) && DIRECT_CHANNEL_ID > 0;
 
   try {
     const token = await getAccessToken();
+
+    const payload = {
+      startingDate: arrival,
+      endingDate: departure,
+      numberOfGuests: guests,
+      version: 2,
+      ...(hasDirectChannelId ? { channelId: DIRECT_CHANNEL_ID } : {}),
+    };
 
     const priceDetailsRes = await fetch(
       `${HOSTAWAY_BASE}/v1/listings/${encodeURIComponent(LISTING_ID)}/calendar/priceDetails`,
       {
         method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-        body: JSON.stringify({
-          startingDate: arrival,
-          endingDate: departure,
-          numberOfGuests: guests,
-          version: 2,
-        }),
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify(payload),
       }
     );
 
@@ -108,6 +135,7 @@ export async function handler(event) {
         error: "Hostaway priceDetails failed",
         message: raw?.message || raw?.error || "unknown",
         details: raw,
+        debug: { payloadSent: payload },
       });
     }
 
@@ -115,12 +143,16 @@ export async function handler(event) {
     const components = result?.components;
 
     if (!Array.isArray(components)) {
-      return json(502, { error: "Hostaway response missing components[]", raw });
+      return json(502, {
+        error: "Hostaway response missing components[]",
+        raw,
+        debug: { payloadSent: payload },
+      });
     }
 
-    // ✅ Your rule:
-    // accommodation already includes Booking Engine markup (-10)
-    // include all other components EXCEPT "discount" (weekly/monthly/coupon)
+    // ✅ Rule:
+    // accommodation should already include Booking Engine markup (-10) WHEN channelId is correct.
+    // Include all other components EXCEPT "discount" to avoid double-applying discounts.
     const accommodationTotal = sumTotals(components, (c) => c.type === "accommodation");
     const otherIncludedTotal = sumTotals(
       components,
@@ -128,7 +160,11 @@ export async function handler(event) {
     );
 
     if (!Number.isFinite(accommodationTotal) || accommodationTotal <= 0) {
-      return json(502, { error: "Could not compute accommodation subtotal from components", raw });
+      return json(502, {
+        error: "Could not compute accommodation subtotal from components",
+        raw,
+        debug: { payloadSent: payload },
+      });
     }
 
     const totalPrice = round2(accommodationTotal + otherIncludedTotal);
@@ -139,13 +175,18 @@ export async function handler(event) {
     return json(200, {
       currency,
       nights,
-      // ✅ return components so frontend can show cleaning fee etc. without hard-coding
       components,
       breakdown: {
-        accommodationSubtotal: round2(accommodationTotal), // already includes Booking Engine Markup
-        otherIncludedTotal: round2(otherIncludedTotal),   // fees/taxes/etc (excluding discount)
+        accommodationSubtotal: round2(accommodationTotal),
+        otherIncludedTotal: round2(otherIncludedTotal),
         totalPrice,
         perNight,
+      },
+      // ✅ helps you verify we actually sent channelId
+      debug: {
+        listingId: String(LISTING_ID),
+        directChannelId: hasDirectChannelId ? DIRECT_CHANNEL_ID : null,
+        payloadSent: payload,
       },
     });
   } catch (e) {
