@@ -3,6 +3,7 @@
 // We DO NOT apply any discount in code.
 // Total we send to Hostaway = accommodation + all other components EXCEPT type==="discount".
 // financeField is passed through unchanged.
+// DRY RUN MODE: send {"dryRun": true} to only calculate totals, without creating reservation.
 
 const HOSTAWAY_BASE = "https://api.hostaway.com";
 
@@ -83,9 +84,10 @@ async function getHostawayComputedTotal({
   arrival,
   departure,
   guests,
-  directChannelId, // <- NEW
+  directChannelId,
 }) {
-  const hasDirectChannelId = Number.isFinite(Number(directChannelId)) && Number(directChannelId) > 0;
+  const hasDirectChannelId =
+    Number.isFinite(Number(directChannelId)) && Number(directChannelId) > 0;
 
   const payload = {
     startingDate: arrival,
@@ -96,7 +98,9 @@ async function getHostawayComputedTotal({
   };
 
   const r = await fetch(
-    `${HOSTAWAY_BASE}/v1/listings/${encodeURIComponent(listingId)}/calendar/priceDetails`,
+    `${HOSTAWAY_BASE}/v1/listings/${encodeURIComponent(
+      listingId
+    )}/calendar/priceDetails`,
     {
       method: "POST",
       headers: {
@@ -124,7 +128,8 @@ async function getHostawayComputedTotal({
   const financeField =
     result?.financeField || raw?.financeField || raw?.data?.financeField || null;
 
-  const currency = result?.currency || raw?.currency || raw?.data?.currency || "CHF";
+  const currency =
+    result?.currency || raw?.currency || raw?.data?.currency || "CHF";
 
   if (!Array.isArray(components) || components.length === 0) {
     return {
@@ -147,7 +152,11 @@ async function getHostawayComputedTotal({
   }
 
   // ✅ Same rule as price.js:
-  const accommodationTotal = sumTotals(components, (c) => c.type === "accommodation");
+  const accommodationTotal = sumTotals(
+    components,
+    (c) => c.type === "accommodation"
+  );
+
   const otherIncludedTotal = sumTotals(
     components,
     (c) => c.type !== "accommodation" && c.type !== "discount"
@@ -197,7 +206,10 @@ exports.handler = async (event) => {
     return json(400, { error: "Invalid JSON body" });
   }
 
-  // Required fields
+  // ✅ DRY RUN toggle
+  const dryRun = data?.dryRun === true;
+
+  // Required fields (we keep these same as real booking, so frontend doesn't need changes)
   const required = ["arrival", "departure", "name", "email", "phone", "guests"];
   for (const f of required) {
     if (!data[f]) return json(400, { error: `Missing field: ${f}` });
@@ -224,9 +236,10 @@ exports.handler = async (event) => {
     return json(500, { error: "Missing/invalid HOSTAWAY_LISTING_ID env var" });
   }
 
-  // ✅ Direct/Website channel context (this is your 2013)
+  // ✅ Direct/Website channel context (your 2013)
   const DIRECT_CHANNEL_ID = Number(process.env.HOSTAWAY_DIRECT_CHANNEL_ID);
-  const hasDirectChannelId = Number.isFinite(DIRECT_CHANNEL_ID) && DIRECT_CHANNEL_ID > 0;
+  const hasDirectChannelId =
+    Number.isFinite(DIRECT_CHANNEL_ID) && DIRECT_CHANNEL_ID > 0;
 
   const guests = Math.max(1, Math.min(10, Number(data.guests) || 1));
   const { firstName, lastName } = splitName(data.name);
@@ -251,6 +264,24 @@ exports.handler = async (event) => {
         message: calc.error,
         details: calc.raw,
         debug: calc.debug,
+      });
+    }
+
+    // ✅ DRY RUN RESPONSE (NO RESERVATION CREATED)
+    if (dryRun) {
+      return json(200, {
+        ok: true,
+        dryRun: true,
+        message: "Dry run: totals computed successfully. No reservation was created.",
+        nights,
+        currency: calc.currency,
+        totals: calc.totals,
+        debug: {
+          listingId: String(LISTING_ID),
+          directChannelId: hasDirectChannelId ? DIRECT_CHANNEL_ID : null,
+          priceDetailsPayloadSent: calc.debug?.payloadSent || null,
+        },
+        components: calc.components,
       });
     }
 
@@ -303,7 +334,10 @@ exports.handler = async (event) => {
     }
 
     return json(200, {
-      message: "Booking created (channelId-aware priceDetails → -10 markup applied, full fees included)",
+      ok: true,
+      dryRun: false,
+      message:
+        "Booking created (channelId-aware priceDetails → -10 markup applied, full fees included)",
       nights,
       channelId,
       currency: calc.currency,
@@ -316,6 +350,9 @@ exports.handler = async (event) => {
       hostaway: result,
     });
   } catch (err) {
-    return json(500, { error: "Server crash", details: String(err?.message || err) });
+    return json(500, {
+      error: "Server crash",
+      details: String(err?.message || err),
+    });
   }
 };
