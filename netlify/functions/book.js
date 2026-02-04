@@ -1,9 +1,15 @@
 // netlify/functions/book.js (CommonJS, Node 18+ / Netlify)
+//
 // Uses Hostaway priceDetails v2 WITH channelId context to apply channel-specific markup (booking engine -10).
 // We DO NOT apply any discount in code.
 // Total we send to Hostaway = accommodation + all other components EXCEPT type==="discount".
-// financeField is passed through unchanged.
-// DRY RUN MODE: send {"dryRun": true} to only calculate totals, without creating reservation.
+//
+// financeField:
+// - Some accounts return financeField in priceDetails, some do not.
+// - We treat it as optional: include it only if present.
+//
+// DRY RUN MODE:
+// Send {"dryRun": true} to calculate totals only, without creating a reservation.
 
 const HOSTAWAY_BASE = "https://api.hostaway.com";
 
@@ -76,7 +82,8 @@ function sumTotals(components, predicateFn) {
  * Fetch Hostaway priceDetails and compute:
  * totalToSend = accommodation (includes booking-engine markup when channelId is correct)
  *            + other components excluding "discount"
- * Returns financeField for reservation create.
+ *
+ * financeField is optional: include if present.
  */
 async function getHostawayComputedTotal({
   accessToken,
@@ -125,6 +132,7 @@ async function getHostawayComputedTotal({
   const result = raw?.result || raw?.data?.result || raw?.data || raw;
   const components = result?.components;
 
+  // financeField: OPTIONAL
   const financeField =
     result?.financeField || raw?.financeField || raw?.data?.financeField || null;
 
@@ -141,22 +149,8 @@ async function getHostawayComputedTotal({
     };
   }
 
-  if (!financeField) {
-    return {
-      ok: false,
-      status: 502,
-      error: "Missing financeField in priceDetails response",
-      raw,
-      debug: { payloadSent: payload },
-    };
-  }
-
   // ✅ Same rule as price.js:
-  const accommodationTotal = sumTotals(
-    components,
-    (c) => c.type === "accommodation"
-  );
-
+  const accommodationTotal = sumTotals(components, (c) => c.type === "accommodation");
   const otherIncludedTotal = sumTotals(
     components,
     (c) => c.type !== "accommodation" && c.type !== "discount"
@@ -177,7 +171,7 @@ async function getHostawayComputedTotal({
   return {
     ok: true,
     currency,
-    financeField,
+    financeField, // may be null
     components,
     totals: {
       accommodationSubtotal: round2(accommodationTotal),
@@ -209,7 +203,7 @@ exports.handler = async (event) => {
   // ✅ DRY RUN toggle
   const dryRun = data?.dryRun === true;
 
-  // Required fields (we keep these same as real booking, so frontend doesn't need changes)
+  // Required fields (keep same shape as real booking)
   const required = ["arrival", "departure", "name", "email", "phone", "guests"];
   for (const f of required) {
     if (!data[f]) return json(400, { error: `Missing field: ${f}` });
@@ -276,6 +270,7 @@ exports.handler = async (event) => {
         nights,
         currency: calc.currency,
         totals: calc.totals,
+        financeField: calc.financeField || null,
         debug: {
           listingId: String(LISTING_ID),
           directChannelId: hasDirectChannelId ? DIRECT_CHANNEL_ID : null,
@@ -285,8 +280,8 @@ exports.handler = async (event) => {
       });
     }
 
-    // 2) Create reservation (keep your existing channelId)
-    const channelId = 2020; // partner/website (as you currently use)
+    // 2) Create reservation
+    const channelId = 2020; // partner/website (keep as you have it)
 
     const reservationPayload = {
       channelId,
@@ -305,9 +300,11 @@ exports.handler = async (event) => {
       firstName,
       lastName,
 
-      // ✅ send computed total (already includes -10 via channelId context)
+      // ✅ send computed total
       totalPrice: calc.totals.totalToSend,
-      financeField: calc.financeField,
+
+      // ✅ include financeField only if present
+      ...(calc.financeField ? { financeField: calc.financeField } : {}),
     };
 
     const res = await fetch(`${HOSTAWAY_BASE}/v1/reservations`, {
@@ -336,12 +333,12 @@ exports.handler = async (event) => {
     return json(200, {
       ok: true,
       dryRun: false,
-      message:
-        "Booking created (channelId-aware priceDetails → -10 markup applied, full fees included)",
+      message: "Booking created (channelId-aware priceDetails → markup applied, full fees included)",
       nights,
       channelId,
       currency: calc.currency,
       totals: calc.totals,
+      financeField: calc.financeField || null,
       debug: {
         listingId: String(LISTING_ID),
         directChannelId: hasDirectChannelId ? DIRECT_CHANNEL_ID : null,
