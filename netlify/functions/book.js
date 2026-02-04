@@ -1,8 +1,8 @@
 // netlify/functions/book.js (CommonJS, Node 18+ / Netlify)
-// Booking engine markup (-10) is configured in Hostaway and is already included in components.type==="accommodation".
+// Uses Hostaway priceDetails v2 WITH channelId context to apply channel-specific markup (booking engine -10).
 // We DO NOT apply any discount in code.
 // Total we send to Hostaway = accommodation + all other components EXCEPT type==="discount".
-// We still pass financeField through unchanged.
+// financeField is passed through unchanged.
 
 const HOSTAWAY_BASE = "https://api.hostaway.com";
 
@@ -73,8 +73,9 @@ function sumTotals(components, predicateFn) {
 
 /**
  * Fetch Hostaway priceDetails and compute:
- * totalToSend = accommodation (already includes Booking engine markup) + other components excluding "discount"
- * Also return financeField for reservations create.
+ * totalToSend = accommodation (includes booking-engine markup when channelId is correct)
+ *            + other components excluding "discount"
+ * Returns financeField for reservation create.
  */
 async function getHostawayComputedTotal({
   accessToken,
@@ -82,7 +83,18 @@ async function getHostawayComputedTotal({
   arrival,
   departure,
   guests,
+  directChannelId, // <- NEW
 }) {
+  const hasDirectChannelId = Number.isFinite(Number(directChannelId)) && Number(directChannelId) > 0;
+
+  const payload = {
+    startingDate: arrival,
+    endingDate: departure,
+    numberOfGuests: Number(guests),
+    version: 2,
+    ...(hasDirectChannelId ? { channelId: Number(directChannelId) } : {}),
+  };
+
   const r = await fetch(
     `${HOSTAWAY_BASE}/v1/listings/${encodeURIComponent(listingId)}/calendar/priceDetails`,
     {
@@ -91,12 +103,7 @@ async function getHostawayComputedTotal({
         "Content-Type": "application/json",
         Authorization: `Bearer ${accessToken}`,
       },
-      body: JSON.stringify({
-        startingDate: arrival,
-        endingDate: departure,
-        numberOfGuests: Number(guests),
-        version: 2,
-      }),
+      body: JSON.stringify(payload),
     }
   );
 
@@ -107,6 +114,7 @@ async function getHostawayComputedTotal({
       status: r.status,
       error: raw?.message || raw?.error || "priceDetails failed",
       raw,
+      debug: { payloadSent: payload },
     };
   }
 
@@ -124,6 +132,7 @@ async function getHostawayComputedTotal({
       status: 502,
       error: "Hostaway response missing components[]",
       raw,
+      debug: { payloadSent: payload },
     };
   }
 
@@ -133,10 +142,11 @@ async function getHostawayComputedTotal({
       status: 502,
       error: "Missing financeField in priceDetails response",
       raw,
+      debug: { payloadSent: payload },
     };
   }
 
-  // ✅ Your rule (same as fixed price.js):
+  // ✅ Same rule as price.js:
   const accommodationTotal = sumTotals(components, (c) => c.type === "accommodation");
   const otherIncludedTotal = sumTotals(
     components,
@@ -149,6 +159,7 @@ async function getHostawayComputedTotal({
       status: 502,
       error: "Could not compute accommodation subtotal from components",
       raw,
+      debug: { payloadSent: payload },
     };
   }
 
@@ -163,6 +174,10 @@ async function getHostawayComputedTotal({
       accommodationSubtotal: round2(accommodationTotal),
       otherIncludedTotal: round2(otherIncludedTotal),
       totalToSend,
+    },
+    debug: {
+      directChannelId: hasDirectChannelId ? Number(directChannelId) : null,
+      payloadSent: payload,
     },
   };
 }
@@ -209,19 +224,24 @@ exports.handler = async (event) => {
     return json(500, { error: "Missing/invalid HOSTAWAY_LISTING_ID env var" });
   }
 
+  // ✅ Direct/Website channel context (this is your 2013)
+  const DIRECT_CHANNEL_ID = Number(process.env.HOSTAWAY_DIRECT_CHANNEL_ID);
+  const hasDirectChannelId = Number.isFinite(DIRECT_CHANNEL_ID) && DIRECT_CHANNEL_ID > 0;
+
   const guests = Math.max(1, Math.min(10, Number(data.guests) || 1));
   const { firstName, lastName } = splitName(data.name);
 
   try {
     const accessToken = await getAccessToken();
 
-    // 1) Compute total from Hostaway components (Booking engine markup already included in accommodation)
+    // 1) Compute total from Hostaway components using channel context
     const calc = await getHostawayComputedTotal({
       accessToken,
       listingId: LISTING_ID,
       arrival: data.arrival,
       departure: data.departure,
       guests,
+      directChannelId: hasDirectChannelId ? DIRECT_CHANNEL_ID : null,
     });
 
     if (!calc.ok) {
@@ -230,11 +250,12 @@ exports.handler = async (event) => {
         status: calc.status,
         message: calc.error,
         details: calc.raw,
+        debug: calc.debug,
       });
     }
 
-    // 2) Create reservation
-    const channelId = 2020; // partner/website (keep as you have it)
+    // 2) Create reservation (keep your existing channelId)
+    const channelId = 2020; // partner/website (as you currently use)
 
     const reservationPayload = {
       channelId,
@@ -253,7 +274,7 @@ exports.handler = async (event) => {
       firstName,
       lastName,
 
-      // ✅ send computed total (accommodation + fees, excluding discounts)
+      // ✅ send computed total (already includes -10 via channelId context)
       totalPrice: calc.totals.totalToSend,
       financeField: calc.financeField,
     };
@@ -274,15 +295,24 @@ exports.handler = async (event) => {
         error: "Hostaway reservation create failed",
         message: result?.message || result?.error || "Unknown error",
         details: result,
+        debug: {
+          reservationPayloadSent: reservationPayload,
+          priceDetails: calc.debug,
+        },
       });
     }
 
     return json(200, {
-      message: "Booking created (Hostaway booking engine markup price + full fees sent to Hostaway)",
+      message: "Booking created (channelId-aware priceDetails → -10 markup applied, full fees included)",
       nights,
       channelId,
       currency: calc.currency,
       totals: calc.totals,
+      debug: {
+        listingId: String(LISTING_ID),
+        directChannelId: hasDirectChannelId ? DIRECT_CHANNEL_ID : null,
+        priceDetailsPayloadSent: calc.debug?.payloadSent || null,
+      },
       hostaway: result,
     });
   } catch (err) {
