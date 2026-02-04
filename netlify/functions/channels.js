@@ -1,5 +1,6 @@
-// netlify/functions/channels.js (ESM) — READ ONLY
-// Lists Hostaway channels so you can find the "direct booking / website" channelId.
+// netlify/functions/channels.js (ESM) — READ ONLY (PROBE)
+// Tries multiple possible Hostaway endpoints to list channels.
+// Returns the first successful response.
 
 const HOSTAWAY_BASE = "https://api.hostaway.com";
 
@@ -38,9 +39,7 @@ async function getAccessToken() {
 
   const tokJson = await tokRes.json().catch(() => ({}));
   if (!tokRes.ok || !tokJson?.access_token) {
-    throw new Error(
-      `Token request failed: ${tokJson?.message || tokJson?.error || "unknown"}`
-    );
+    throw new Error(`Token request failed: ${tokJson?.message || tokJson?.error || "unknown"}`);
   }
 
   return tokJson.access_token;
@@ -57,45 +56,53 @@ export async function handler(event) {
   try {
     const token = await getAccessToken();
 
-    const r = await fetch(`${HOSTAWAY_BASE}/v1/channels`, {
-      method: "GET",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Accept: "application/json",
-      },
-    });
+    const candidates = [
+      "/v1/channels",
+      "/v1/channel",
+      "/v1/reservationChannels",
+      "/v1/reservationChannel",
+      "/v1/bookingChannels",
+      "/v1/bookingChannel",
+      "/v1/integrations/channels",
+      "/v1/channels/list",
+    ];
 
-    const raw = await r.json().catch(() => ({}));
+    const attempts = [];
 
-    if (!r.ok) {
-      return json(r.status || 500, {
-        error: "Hostaway /v1/channels failed",
-        message: raw?.message || raw?.error || "unknown",
-        details: raw,
+    for (const path of candidates) {
+      const url = `${HOSTAWAY_BASE}${path}`;
+      const r = await fetch(url, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+      });
+
+      const raw = await r.json().catch(() => ({}));
+      attempts.push({
+        path,
+        ok: r.ok,
+        status: r.status,
+        message: raw?.message || raw?.error || null,
+      });
+
+      if (!r.ok) continue;
+
+      const result = raw?.result || raw?.data?.result || raw?.data || raw;
+
+      return json(200, {
+        ok: true,
+        workingEndpoint: path,
+        // Try to expose some likely shapes
+        result,
+        attempts,
       });
     }
 
-    // Hostaway usually returns { status:"success", result:[...] }
-    const result = raw?.result || raw?.data?.result || raw?.data || raw;
-    const channels = Array.isArray(result) ? result : Array.isArray(result?.channels) ? result.channels : null;
-
-    if (!Array.isArray(channels)) {
-      return json(502, { error: "Unexpected channels response shape", raw });
-    }
-
-    // Return a compact list + full raw list for debugging
-    const compact = channels.map((c) => ({
-      id: c.id ?? c.channelId ?? c.channel_id ?? null,
-      name: c.name ?? c.channelName ?? null,
-      type: c.type ?? c.channelType ?? null,
-      isActive: c.isActive ?? c.active ?? null,
-      raw: c, // keep full object (helpful once, remove later if you want)
-    }));
-
-    return json(200, {
-      count: compact.length,
-      channels: compact,
-      // raw, // uncomment if you want everything
+    return json(502, {
+      ok: false,
+      error: "No known channels endpoint worked with this token/scope.",
+      attempts,
+      hint:
+        "This usually means: endpoint name differs for your account, or token scope lacks permission. Ask Hostaway support which exact endpoint + scope returns channel ids for your account.",
     });
   } catch (e) {
     return json(500, { error: "Server error", details: String(e?.message || e) });
